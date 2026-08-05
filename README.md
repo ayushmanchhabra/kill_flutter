@@ -183,6 +183,8 @@ python3 kill_flutter.py app.apk -i 192.168.1.10 -o /tmp/pentest
 # Force platform (if extension is ambiguous)
 python3 kill_flutter.py app.apk --platform android -i 192.168.1.10
 ```
+![options](help0.png)
+![options](help1.png)
 
 ---
 
