@@ -1,6 +1,6 @@
 # K!ll Fl!utter 🔪
 
-![K!ll Fl!utter](flutter.jpg)
+![K!ll Fl!utter](banner.png)
 
 > **Flutter SSL Pinning Bypass Tool — Android & iOS**  
 > By [f3rb](https://github.com/f3rb)  
@@ -31,7 +31,6 @@ version not in that database simply won't be patched correctly.
 ---
 
 ## The Solution
-
 K!ll Fl!utter takes a fundamentally different approach. Instead of relying on
 known patterns or version databases, it **derives the exact hook offset directly
 from the binary itself**. The offset is found with version-agnostic techniques,
