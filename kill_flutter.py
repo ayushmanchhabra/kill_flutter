@@ -2,6 +2,7 @@
 # K!ll Fl!utter - Flutter SSL Pinning Bypass Tool
 # By: f3rb
 # Supports: Android (APK) + iOS (IPA)
+# Architectures: arm64-v8a, x86_64, armeabi-v7a (Android) + arm64 (iOS)
 # For authorized penetration testing only
 
 import struct, re, sys, os, zipfile, subprocess, argparse, plistlib
@@ -57,8 +58,9 @@ def print_banner():
 
     print(box_top())
     print(box_line("  K!ll Fl!utter  —  Flutter SSL Pinning Bypass", C_YELLOW))
-    print(box_line("  By: f3rb                              v2.0.0", C_GREEN))
+    print(box_line("  By: f3rb                              v3.0.0", C_GREEN))
     print(box_line("  Android (APK) + iOS (IPA) Support", C_PURPLE))
+    print(box_line("  Multi-arch: arm64 / x86_64 / armeabi-v7a", C_PURPLE))
     print(box_line("  For authorized penetration testing only", C_PURPLE))
     print(box_bottom())
     print("")
@@ -75,39 +77,53 @@ def print_help():
   \033[92m-i, --ip\033[0m            Your machine IP (for proxy/iptables commands)
   \033[92m-p, --port\033[0m          Burp Suite port (default: 8080)
   \033[92m-o, --output\033[0m        Output directory for generated files
-  \033[92m--platform\033[0m          Force platform: android or ios (auto-detected from extension)
+  \033[92m--arch\033[0m              Android ABI to target: arm64-v8a | x86_64 |
+                      armeabi-v7a | x86  (auto-detected if omitted;
+                      defaults to arm64-v8a when present)
+  \033[92m--list-arch\033[0m         List the ABIs bundled in the APK and exit
+  \033[92m--platform\033[0m          Force platform: android or ios
+  \033[92m--device-ip\033[0m         iOS device IP (for SSH iptables)
 
 \033[93mEXAMPLES:\033[0m
-  \033[90m# Android APK\033[0m
+  \033[90m# Android APK (defaults to arm64-v8a)\033[0m
   python3 kill_flutter.py app.apk -i 192.168.1.10 -p 8080
+
+  \033[90m# Target an x86_64 emulator build\033[0m
+  python3 kill_flutter.py app.apk --arch x86_64 -i 192.168.1.10
+
+  \033[90m# Target a 32-bit device build\033[0m
+  python3 kill_flutter.py app.apk --arch armeabi-v7a -i 192.168.1.10
+
+  \033[90m# Just see what's inside\033[0m
+  python3 kill_flutter.py app.apk --list-arch
 
   \033[90m# iOS IPA\033[0m
   python3 kill_flutter.py app.ipa -i 192.168.1.10 -p 8080
 
-  \033[90m# Force platform\033[0m
-  python3 kill_flutter.py app.apk --platform android -i 192.168.1.10
-
 \033[93mWORKFLOW:\033[0m
   \033[96m1.\033[0m Auto-detects platform from file extension
-  \033[96m2.\033[0m Extracts Flutter engine binary (libflutter.so / Flutter framework)
+  \033[96m2.\033[0m Extracts the chosen ABI's libflutter.so (or Flutter framework)
   \033[96m3.\033[0m Scans for ssl_client/ssl_server string anchors
-  \033[96m4.\033[0m Parses ELF (Android) or Mach-O (iOS) segments
-  \033[96m5.\033[0m Finds ADRP+ADD instruction pairs referencing both strings
-  \033[96m6.\033[0m Walks back to function prologue to get exact hook offset
-  \033[96m7.\033[0m Generates ready-to-use Frida script
-  \033[96m8.\033[0m Prints copy-paste commands for your platform
+  \033[96m4.\033[0m Detects arch from the ELF/Mach-O header and routes to the
+     matching offset engine (ARM64 ADRP+ADD, x86_64 RIP-relative LEA,
+     or ARMv7 MOVW/MOVT+ADD-PC / literal pool)
+  \033[96m5.\033[0m Walks back to the function prologue to get the hook offset
+  \033[96m6.\033[0m Generates a ready-to-use Frida script + copy-paste commands
 
 \033[93mREQUIREMENTS:\033[0m
   \033[92m- Python 3\033[0m
   \033[92m- Frida\033[0m             pip install frida-tools
+  \033[92m- capstone\033[0m          pip install capstone   (only for x86_64 / armeabi-v7a)
   \033[92m- aapt\033[0m              Android SDK build tools (Android only)
   \033[92m- Rooted Android / Jailbroken iOS device\033[0m
   \033[92m- Burp Suite\033[0m        invisible proxy on all interfaces
 
-\033[93mBURP SETUP:\033[0m
-  \033[96m-\033[0m Proxy → Listeners → Bind to 0.0.0.0:8080
-  \033[96m-\033[0m Request handling → Enable invisible proxying
-  \033[96m-\033[0m Intercept → OFF
+\033[93mNOTE ON ARCHITECTURES:\033[0m
+  Android maps only the ABI matching the device/emulator at runtime, so the
+  offset must come from the SAME ABI you will actually run Frida against:
+    - real phones          -> arm64-v8a (a few old/budget ones -> armeabi-v7a)
+    - Intel/AMD emulators  -> x86_64 (older images -> x86)
+  The arm64 engine is dependency-free. x86_64 and armeabi-v7a require capstone.
 
 \033[93mANDROID — REVERT IPTABLES:\033[0m
   adb shell su -c "iptables -t nat -D OUTPUT -p tcp --dport 443 -j DNAT --to-destination <IP>:8080"
@@ -170,7 +186,7 @@ def get_bundle_id_ios(ipa_path):
                 if re.match(r'Payload/[^/]+\.app/Info\.plist$', name):
                     with z.open(name) as f:
                         content = f.read()
-                    
+
                     try:
                         plist_data = plistlib.loads(content)
                         if 'CFBundleIdentifier' in plist_data:
@@ -183,21 +199,58 @@ def get_bundle_id_ios(ipa_path):
 
 
 # ─────────────────────────────────────────────
-#  ANDROID — EXTRACT libflutter.so
+#  ANDROID — EXTRACT libflutter.so (arch-aware)
 # ─────────────────────────────────────────────
 
-def extract_flutter_android(apk_path, out_dir):
-    so_path = os.path.join(out_dir, 'libflutter.so')
-    print(f"\033[96m[*]\033[0m Extracting libflutter.so from APK...")
+# ABIs we know how to analyse, best -> worst practical value
+KNOWN_ABIS = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
+
+
+def list_flutter_arches(apk_path):
+    """Return {abi: zip_entry_name} for every libflutter.so found in the APK."""
+    found = {}
     with zipfile.ZipFile(apk_path, 'r') as z:
         for name in z.namelist():
-            if 'arm64-v8a/libflutter.so' in name:
-                print(f"\033[92m[+]\033[0m Found: {name}")
-                with z.open(name) as src, open(so_path, 'wb') as dst:
-                    dst.write(src.read())
-                return so_path
-    print("\033[91m[-] libflutter.so (arm64-v8a) not found — is this a Flutter APK?\033[0m")
-    return None
+            m = re.search(r'lib/([^/]+)/libflutter\.so$', name)
+            if m:
+                found[m.group(1)] = name
+    return found
+
+
+def extract_flutter_android(apk_path, out_dir, arch=None):
+    """Extract the requested (or auto-selected) ABI's libflutter.so.
+    Returns (so_path, abi) or (None, None)."""
+    arches = list_flutter_arches(apk_path)
+    if not arches:
+        print("\033[91m[-] No libflutter.so found in any lib/<abi>/ — is this a Flutter APK?\033[0m")
+        return None, None
+
+    available = ', '.join(sorted(arches))
+    print(f"\033[96m[*]\033[0m ABIs present in APK: \033[93m{available}\033[0m")
+
+    if arch is None:
+        # Prefer arm64-v8a (real devices), then fall back to the first known ABI
+        for cand in KNOWN_ABIS:
+            if cand in arches:
+                arch = cand
+                break
+        if arch is None:
+            arch = sorted(arches)[0]
+        print(f"\033[96m[*]\033[0m No --arch given, auto-selected: \033[93m{arch}\033[0m")
+
+    if arch not in arches:
+        print(f"\033[91m[-] ABI '{arch}' not bundled in this APK.\033[0m")
+        print(f"\033[93m[!] Available: {available}  (pass one with --arch)\033[0m")
+        return None, None
+
+    so_path = os.path.join(out_dir, f'libflutter_{arch}.so')
+    print(f"\033[96m[*]\033[0m Extracting {arch}/libflutter.so ...")
+    with zipfile.ZipFile(apk_path, 'r') as z:
+        with z.open(arches[arch]) as src, open(so_path, 'wb') as dst:
+            dst.write(src.read())
+    print(f"\033[92m[+]\033[0m Found: {arches[arch]}")
+    print(f"\033[92m[+]\033[0m Saved: {so_path}")
+    return so_path, arch
 
 
 # ─────────────────────────────────────────────
@@ -219,11 +272,12 @@ def extract_flutter_ios(ipa_path, out_dir):
 
 
 # ─────────────────────────────────────────────
-#  ELF SEGMENT PARSER (Android ARM64)
+#  ELF SEGMENT PARSERS
 # ─────────────────────────────────────────────
 
-def parse_elf_segments(data):
-    """Returns (base_vaddr, code_foff, code_vaddr, code_filesz) for the executable segment."""
+def parse_elf64_segments(data):
+    """ELF64 (arm64-v8a, x86_64).
+    Returns (base_vaddr, code_foff, code_vaddr, code_filesz)."""
     if data[:4] != b'\x7fELF':
         return None, None, None, None
 
@@ -233,14 +287,14 @@ def parse_elf_segments(data):
 
     base_vaddr = None
     code_foff = code_vaddr = code_filesz = None
-    
+
     for i in range(e_phnum):
         ph      = data[e_phoff + i*e_phentsize : e_phoff + (i+1)*e_phentsize]
         p_type  = struct.unpack_from('<I', ph, 0x00)[0]
         p_flags = struct.unpack_from('<I', ph, 0x04)[0]
         p_offset = struct.unpack_from('<Q', ph, 0x08)[0]
         p_vaddr  = struct.unpack_from('<Q', ph, 0x10)[0]
-        
+
         # PT_LOAD
         if p_type == 1:
             if p_offset == 0 and base_vaddr is None:
@@ -250,11 +304,50 @@ def parse_elf_segments(data):
                 code_foff   = p_offset
                 code_vaddr  = p_vaddr
                 code_filesz = struct.unpack_from('<Q', ph, 0x20)[0]
-                print(f"\033[96m[*]\033[0m ELF code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
+                print(f"\033[96m[*]\033[0m ELF64 code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
 
     if base_vaddr is None:
         base_vaddr = 0
-        
+
+    return base_vaddr, code_foff, code_vaddr, code_filesz
+
+
+def parse_elf32_segments(data):
+    """ELF32 (armeabi-v7a, x86).
+    Program header layout differs from ELF64 (p_flags is at +0x18).
+    Returns (base_vaddr, code_foff, code_vaddr, code_filesz)."""
+    if data[:4] != b'\x7fELF':
+        return None, None, None, None
+
+    e_phoff     = struct.unpack_from('<I', data, 0x1C)[0]
+    e_phentsize = struct.unpack_from('<H', data, 0x2A)[0]
+    e_phnum     = struct.unpack_from('<H', data, 0x2C)[0]
+
+    base_vaddr = None
+    code_foff = code_vaddr = code_filesz = None
+
+    for i in range(e_phnum):
+        ph       = data[e_phoff + i*e_phentsize : e_phoff + (i+1)*e_phentsize]
+        p_type   = struct.unpack_from('<I', ph, 0x00)[0]
+        p_offset = struct.unpack_from('<I', ph, 0x04)[0]
+        p_vaddr  = struct.unpack_from('<I', ph, 0x08)[0]
+        p_filesz = struct.unpack_from('<I', ph, 0x10)[0]
+        p_flags  = struct.unpack_from('<I', ph, 0x18)[0]   # ELF32: flags at +0x18
+
+        # PT_LOAD
+        if p_type == 1:
+            if p_offset == 0 and base_vaddr is None:
+                base_vaddr = p_vaddr
+            # PF_X
+            if (p_flags & 1):
+                code_foff   = p_offset
+                code_vaddr  = p_vaddr
+                code_filesz = p_filesz
+                print(f"\033[96m[*]\033[0m ELF32 code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
+
+    if base_vaddr is None:
+        base_vaddr = 0
+
     return base_vaddr, code_foff, code_vaddr, code_filesz
 
 
@@ -310,7 +403,7 @@ def parse_macho_segments(data):
             fileoff  = struct.unpack_from('<Q', data, cmd_off + 40)[0]
             filesize = struct.unpack_from('<Q', data, cmd_off + 48)[0]
             maxprot  = struct.unpack_from('<I', data, cmd_off + 56)[0]
-            
+
             if fileoff == 0 and base_vaddr is None:
                 base_vaddr = vmaddr
 
@@ -322,7 +415,7 @@ def parse_macho_segments(data):
                 print(f"\033[96m[*]\033[0m Mach-O __TEXT segment: file={hex(fileoff)} vaddr={hex(vmaddr)} size={hex(filesize)}")
 
         cmd_off += cmdsize
-        
+
     if base_vaddr is None:
         base_vaddr = 0
 
@@ -330,44 +423,52 @@ def parse_macho_segments(data):
 
 
 # ─────────────────────────────────────────────
-#  CORE — FIND SSL OFFSET (shared for both platforms)
+#  ARCH DETECTION (from the extracted binary itself)
 # ─────────────────────────────────────────────
 
-def find_offset(binary_path, platform):
-    print(f"\033[96m[*]\033[0m Loading binary: {binary_path}")
-    with open(binary_path, 'rb') as f:
-        data = f.read()
+# EI_CLASS, e_machine -> engine key
+EM_AARCH64 = 0xB7   # 183
+EM_X86_64  = 0x3E   # 62
+EM_ARM     = 0x28   # 40
+EM_386     = 0x03   # 3
 
-    # Find string anchors
-    ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
-    ssl_server  = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
 
-    if not ssl_client or not ssl_server:
-        print("\033[91m[-] ssl_client/ssl_server strings not found — may not be a Flutter binary\033[0m")
+def detect_binary_arch(data):
+    """Return one of: 'arm64', 'x86_64', 'arm', 'x86', or None (from ELF header)."""
+    if data[:4] != b'\x7fELF':
+        return None
+    ei_class = data[4]          # 1=ELF32, 2=ELF64
+    e_machine = struct.unpack_from('<H', data, 0x12)[0]
+    if ei_class == 2 and e_machine == EM_AARCH64:
+        return 'arm64'
+    if ei_class == 2 and e_machine == EM_X86_64:
+        return 'x86_64'
+    if ei_class == 1 and e_machine == EM_ARM:
+        return 'arm'
+    if ei_class == 1 and e_machine == EM_386:
+        return 'x86'
+    return None
+
+
+def _load_capstone():
+    try:
+        import capstone  # noqa
+        return capstone
+    except ImportError:
+        print("\033[91m[-] This architecture needs capstone.\033[0m")
+        print("\033[93m[!] Install it with:  pip install capstone\033[0m")
         return None
 
-    print(f"\033[92m[+]\033[0m ssl_client @ {[hex(x) for x in ssl_client]}")
-    print(f"\033[92m[+]\033[0m ssl_server @ {[hex(x) for x in ssl_server]}")
 
-    # Parse segments based on platform
-    if platform == 'android':
-        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf_segments(data)
-    else:
-        base_vaddr, code_foff, code_vaddr, code_filesz, data = parse_macho_segments(data)
-        # Re-find strings in possibly-sliced data
-        ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
-        ssl_server  = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
-        if not ssl_client or not ssl_server:
-            print("\033[91m[-] ssl_client/ssl_server strings not found in arm64 slice\033[0m")
-            return None
+# ─────────────────────────────────────────────
+#  ENGINE — ARM64 (ELF & Mach-O). Dependency-free.
+#  ADRP+ADD reference finding + prologue walk-back.
+# ─────────────────────────────────────────────
 
-    if code_foff is None:
-        print("\033[91m[-] No executable segment found\033[0m")
-        return None
-
+def scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server):
     def foff_to_vaddr(fo):
         return fo - code_foff + code_vaddr
-        
+
     def foff_to_rva(fo):
         return (fo - code_foff + code_vaddr) - base_vaddr
 
@@ -376,10 +477,11 @@ def find_offset(binary_path, platform):
         refs = []
         for fi in range(code_foff, code_foff + code_filesz - 4, 4):
             instr = struct.unpack_from('<I', data, fi)[0]
+            # ADD (immediate, 64-bit) with matching lo12
             if (instr & 0xffc00000) == 0x91000000 and ((instr >> 10) & 0xfff) == lo12:
                 if fi >= 4:
                     adrp = struct.unpack_from('<I', data, fi - 4)[0]
-                    if (adrp & 0x9f000000) == 0x90000000:
+                    if (adrp & 0x9f000000) == 0x90000000:  # ADRP
                         immlo = (adrp >> 29) & 0x3
                         immhi = (adrp >> 5) & 0x7ffff
                         imm = ((immhi << 2) | immlo) << 12
@@ -390,7 +492,7 @@ def find_offset(binary_path, platform):
                             refs.append(fi)
         return refs
 
-    print(f"\033[96m[*]\033[0m Scanning ADRP+ADD refs... (may take a moment)")
+    print(f"\033[96m[*]\033[0m [arm64] Scanning ADRP+ADD refs... (may take a moment)")
     sc_refs = find_refs(ssl_client[0])
     ss_refs = find_refs(ssl_server[0])
     print(f"\033[96m[*]\033[0m ssl_client code refs: {[hex(x) for x in sc_refs]}")
@@ -402,14 +504,285 @@ def find_offset(binary_path, platform):
                 start = min(a, b)
                 for i in range(start, max(code_foff, start - 0x300), -4):
                     instr = struct.unpack_from('<I', data, i)[0]
+                    # SUB SP,SP,#imm  or  STP X29,X30,[SP,...]
                     if (instr & 0xff8003ff) == 0xd10003ff or (instr & 0xffe07fff) == 0xa9007bfd:
                         rva = foff_to_rva(i)
-                        print(f"\033[92m[+]\033[0m SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
+                        print(f"\033[92m[+]\033[0m [arm64] SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
                         print(f"\033[92m[+]\033[0m First bytes: {data[i:i+16].hex(' ')}")
                         return rva
 
-    print("\033[91m[-] Could not find SSL verify function\033[0m")
+    print("\033[91m[-] [arm64] Could not find SSL verify function\033[0m")
     return None
+
+
+# ─────────────────────────────────────────────
+#  ENGINE — x86_64 (ELF). Needs capstone.
+#  RIP-relative LEA reference finding + function-start detection.
+# ─────────────────────────────────────────────
+
+def scan_x86_64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server):
+    cs = _load_capstone()
+    if cs is None:
+        return None
+    from capstone.x86 import X86_OP_MEM
+
+    md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
+    md.detail = True
+
+    code = data[code_foff:code_foff + code_filesz]
+
+    print(f"\033[96m[*]\033[0m [x86_64] Linear disassembly of code segment...")
+    insns = []                    # ordered (addr, size, mnemonic, op_str)
+    addr_index = {}
+    for insn in md.disasm(code, code_vaddr):
+        addr_index[insn.address] = len(insns)
+        insns.append(insn)
+    if not insns:
+        print("\033[91m[-] [x86_64] Disassembly produced no instructions\033[0m")
+        return None
+
+    sc_va = ssl_client[0]
+    ss_va = ssl_server[0]
+
+    def lea_refs(target_va):
+        refs = []
+        for insn in insns:
+            if insn.mnemonic != 'lea':
+                continue
+            for op in insn.operands:
+                if op.type == X86_OP_MEM and op.mem.base and \
+                   insn.reg_name(op.mem.base) == 'rip' and op.mem.index == 0:
+                    if insn.address + insn.size + op.mem.disp == target_va:
+                        refs.append(insn.address)
+        return refs
+
+    sc_refs = lea_refs(sc_va)
+    ss_refs = lea_refs(ss_va)
+    print(f"\033[96m[*]\033[0m ssl_client LEA refs: {[hex(x) for x in sc_refs]}")
+    print(f"\033[96m[*]\033[0m ssl_server LEA refs: {[hex(x) for x in ss_refs]}")
+
+    if not sc_refs or not ss_refs:
+        print("\033[91m[-] [x86_64] Missing RIP-relative refs to one/both anchors\033[0m")
+        return None
+
+    # Function-start candidates: endbr64, or the instruction right after a
+    # control-flow break (ret/jmp/int3), or the very first instruction.
+    BREAKERS = {'ret', 'jmp', 'int3', 'ud2'}
+    candidates = set()
+    for i, insn in enumerate(insns):
+        if i == 0 or insn.mnemonic == 'endbr64':
+            candidates.add(insn.address)
+        elif i > 0 and insns[i-1].mnemonic in BREAKERS:
+            candidates.add(insn.address)
+    sorted_c = sorted(candidates)
+
+    def func_start_before(va):
+        import bisect
+        idx = bisect.bisect_right(sorted_c, va) - 1
+        return sorted_c[idx] if idx >= 0 else None
+
+    # Pair refs that sit in the same function (window generous for x86 funcs)
+    for a in sc_refs:
+        for b in ss_refs:
+            if abs(a - b) < 0x1200:
+                fs = func_start_before(min(a, b))
+                if fs is not None:
+                    rva = fs - base_vaddr
+                    fo = fs - code_vaddr + code_foff
+                    print(f"\033[92m[+]\033[0m [x86_64] SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
+                    print(f"\033[92m[+]\033[0m First bytes: {data[fo:fo+16].hex(' ')}")
+                    return rva
+
+    print("\033[91m[-] [x86_64] Could not resolve enclosing function\033[0m")
+    return None
+
+
+# ─────────────────────────────────────────────
+#  ENGINE — armeabi-v7a (ELF32). Needs capstone.
+#  MOVW/MOVT+ADD-PC and LDR-literal refs + PUSH{...,lr} prologue.
+#  Flutter ARM32 is compiled as Thumb-2.
+# ─────────────────────────────────────────────
+
+def scan_arm32(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server):
+    cs = _load_capstone()
+    if cs is None:
+        return None
+    from capstone.arm import ARM_OP_REG, ARM_OP_IMM, ARM_REG_PC
+
+    def align4(x):
+        return x & ~3
+
+    def run(mode_thumb):
+        mode = cs.CS_MODE_THUMB if mode_thumb else cs.CS_MODE_ARM
+        md = cs.Cs(cs.CS_ARCH_ARM, mode)
+        md.detail = True
+        code = data[code_foff:code_foff + code_filesz]
+
+        insns = []
+        for insn in md.disasm(code, code_vaddr):
+            insns.append(insn)
+        return insns
+
+    # Flutter ARM32 engine is Thumb-2; try Thumb first, fall back to ARM.
+    insns = run(True)
+    label = 'thumb'
+    if len(insns) < (code_filesz // 8):     # suspiciously sparse -> try ARM
+        alt = run(False)
+        if len(alt) > len(insns):
+            insns, label = alt, 'arm'
+    print(f"\033[96m[*]\033[0m [armeabi-v7a] Disassembled {len(insns)} insns ({label} mode)")
+
+    sc_va = ssl_client[0]
+    ss_va = ssl_server[0]
+
+    # --- Pass 1: MOVW/MOVT + ADD Rd,PC (PIC address computation) ---
+    def movw_movt_refs():
+        sc, ss = [], []
+        regs = {}
+        for insn in insns:
+            m = insn.mnemonic
+            ops = insn.operands
+            if m == 'movw' and len(ops) == 2 and ops[0].type == ARM_OP_REG and ops[1].type == ARM_OP_IMM:
+                regs[ops[0].reg] = ops[1].imm & 0xffff
+            elif m == 'movt' and len(ops) == 2 and ops[0].type == ARM_OP_REG and ops[1].type == ARM_OP_IMM:
+                r = ops[0].reg
+                regs[r] = (regs.get(r, 0) & 0xffff) | ((ops[1].imm & 0xffff) << 16)
+            elif m == 'add' and len(ops) >= 2 and ops[-1].type == ARM_OP_REG and ops[-1].reg == ARM_REG_PC:
+                rd = ops[0].reg
+                if rd in regs:
+                    pc = align4(insn.address + 4)
+                    tgt = (pc + regs[rd]) & 0xffffffff
+                    if tgt == sc_va:
+                        sc.append(insn.address)
+                    elif tgt == ss_va:
+                        ss.append(insn.address)
+            else:
+                # a plain mov/other write to a reg invalidates stale tracking
+                if ops and ops[0].type == ARM_OP_REG and m in ('mov', 'ldr', 'sub', 'orr', 'eor'):
+                    regs.pop(ops[0].reg, None)
+        return sc, ss
+
+    # --- Pass 2: LDR Rd,[pc,#imm] literal pool (best-effort) ---
+    def ldr_literal_refs():
+        sc, ss = [], []
+        for insn in insns:
+            if insn.mnemonic != 'ldr':
+                continue
+            ops = insn.operands
+            # ldr rd, [pc, #imm]
+            if len(ops) == 2 and ops[1].type == cs.arm.ARM_OP_MEM and \
+               ops[1].mem.base == ARM_REG_PC:
+                pool_va = align4(insn.address + 4) + ops[1].mem.disp
+                pool_fo = pool_va - code_vaddr + code_foff
+                if 0 <= pool_fo <= len(data) - 4:
+                    word = struct.unpack_from('<I', data, pool_fo)[0]
+                    if word == sc_va:
+                        sc.append(insn.address)
+                    elif word == ss_va:
+                        ss.append(insn.address)
+        return sc, ss
+
+    sc_refs, ss_refs = movw_movt_refs()
+    if not (sc_refs and ss_refs):
+        l_sc, l_ss = ldr_literal_refs()
+        sc_refs += l_sc
+        ss_refs += l_ss
+    print(f"\033[96m[*]\033[0m ssl_client refs: {[hex(x) for x in sc_refs]}")
+    print(f"\033[96m[*]\033[0m ssl_server refs: {[hex(x) for x in ss_refs]}")
+
+    if not sc_refs or not ss_refs:
+        print("\033[91m[-] [armeabi-v7a] Missing refs to one/both anchors\033[0m")
+        return None
+
+    # Function starts: Thumb prologue PUSH {..., lr}
+    push_lr = []
+    for insn in insns:
+        if insn.mnemonic in ('push', 'push.w') and 'lr' in insn.op_str:
+            push_lr.append(insn.address)
+    push_lr.sort()
+
+    def func_start_before(va):
+        import bisect
+        idx = bisect.bisect_right(push_lr, va) - 1
+        return push_lr[idx] if idx >= 0 else None
+
+    for a in sc_refs:
+        for b in ss_refs:
+            if abs(a - b) < 0x800:
+                fs = func_start_before(min(a, b))
+                if fs is not None:
+                    rva = fs - base_vaddr
+                    fo = fs - code_vaddr + code_foff
+                    print(f"\033[92m[+]\033[0m [armeabi-v7a] SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
+                    print(f"\033[92m[+]\033[0m First bytes: {data[fo:fo+16].hex(' ')}")
+                    # Thumb functions are odd-addressed when branched to; the
+                    # module-base + rva Frida hook works with the even address.
+                    return rva
+
+    print("\033[91m[-] [armeabi-v7a] Could not resolve enclosing function\033[0m")
+    return None
+
+
+# ─────────────────────────────────────────────
+#  CORE — FIND SSL OFFSET (dispatches by architecture)
+# ─────────────────────────────────────────────
+
+def find_offset(binary_path, platform, arch=None):
+    print(f"\033[96m[*]\033[0m Loading binary: {binary_path}")
+    with open(binary_path, 'rb') as f:
+        data = f.read()
+
+    # Find string anchors (architecture-independent)
+    ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
+    ssl_server = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
+
+    if not ssl_client or not ssl_server:
+        print("\033[91m[-] ssl_client/ssl_server strings not found — may not be a Flutter binary\033[0m")
+        return None
+
+    print(f"\033[92m[+]\033[0m ssl_client @ {[hex(x) for x in ssl_client]}")
+    print(f"\033[92m[+]\033[0m ssl_server @ {[hex(x) for x in ssl_server]}")
+
+    # ---- iOS: always arm64 Mach-O ----
+    if platform == 'ios':
+        base_vaddr, code_foff, code_vaddr, code_filesz, data = parse_macho_segments(data)
+        ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
+        ssl_server = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
+        if not ssl_client or not ssl_server:
+            print("\033[91m[-] ssl_client/ssl_server strings not found in arm64 slice\033[0m")
+            return None
+        if code_foff is None:
+            print("\033[91m[-] No executable segment found\033[0m")
+            return None
+        return scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+
+    # ---- Android: detect arch from the ELF header itself ----
+    bin_arch = detect_binary_arch(data)
+    if bin_arch is None:
+        print("\033[91m[-] Unrecognised ELF machine type\033[0m")
+        return None
+    print(f"\033[96m[*]\033[0m Binary arch (from ELF header): \033[93m{bin_arch}\033[0m")
+
+    if bin_arch in ('arm64', 'x86_64'):
+        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf64_segments(data)
+    else:  # arm (v7a) / x86 -> ELF32
+        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf32_segments(data)
+
+    if code_foff is None:
+        print("\033[91m[-] No executable segment found\033[0m")
+        return None
+
+    if bin_arch == 'arm64':
+        return scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+    elif bin_arch == 'x86_64':
+        return scan_x86_64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+    elif bin_arch == 'arm':
+        return scan_arm32(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+    else:  # x86 (32-bit) — rare (old emulator images)
+        print("\033[93m[!] x86 (32-bit) has no PC-relative addressing; static "
+              "resolution is unreliable. Prefer x86_64 or run objection/frida "
+              "dynamically. Skipping.\033[0m")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -417,7 +790,7 @@ def find_offset(binary_path, platform):
 # ─────────────────────────────────────────────
 
 def write_frida_script(offset, package, platform, out_path):
-    # Module name differs between platforms
+    # Module name is libflutter.so on ALL Android ABIs; Flutter on iOS.
     module_name = 'libflutter.so' if platform == 'android' else 'Flutter'
 
     script = f"""// ================================================
@@ -525,10 +898,12 @@ def print_commands_ios(package, proxy, script_path, device_ip):
     print("\033[90m  # or just reboot the device\033[0m")
 
 
-def print_summary(package, offset, script_path, proxy, platform):
+def print_summary(package, offset, script_path, proxy, platform, arch=None):
     print("")
     print(box_top())
     print(box_line(f"  Platform : {platform.upper()}", C_GREEN))
+    if arch:
+        print(box_line(f"  ABI      : {arch}", C_GREEN))
     print(box_line(f"  Package  : {package}", C_GREEN))
     print(box_line(f"  Offset   : {hex(offset)}", C_GREEN))
     print(box_line(f"  Script   : {os.path.basename(script_path)}", C_GREEN))
@@ -551,6 +926,8 @@ def main():
     parser.add_argument('-i', '--ip', default='<YOUR_IP>', help='Your machine IP')
     parser.add_argument('-p', '--port', default='8080', help='Burp port')
     parser.add_argument('-o', '--output', help='Output directory')
+    parser.add_argument('--arch', choices=KNOWN_ABIS, help='Android ABI to target')
+    parser.add_argument('--list-arch', action='store_true', help='List ABIs in the APK and exit')
     parser.add_argument('--platform', choices=['android', 'ios'], help='Force platform')
     parser.add_argument('--device-ip', default='<DEVICE_IP>', help='iOS device IP (for SSH iptables)')
     args = parser.parse_args()
@@ -567,6 +944,22 @@ def main():
         sys.exit(1)
 
     platform = detect_platform(app_path, args.platform)
+
+    # --list-arch shortcut (Android only)
+    if args.list_arch:
+        if platform != 'android':
+            print("\033[93m[!] --list-arch only applies to Android APKs\033[0m")
+            sys.exit(0)
+        arches = list_flutter_arches(app_path)
+        if not arches:
+            print("\033[91m[-] No libflutter.so found in this APK\033[0m")
+        else:
+            print("\033[92m[+]\033[0m ABIs bundled in this APK:")
+            for a in sorted(arches):
+                supported = "\033[92msupported\033[0m" if a in ('arm64-v8a', 'x86_64', 'armeabi-v7a') else "\033[93mlimited\033[0m"
+                print(f"    - {a:<14} ({supported})")
+        sys.exit(0)
+
     out_dir  = args.output or os.path.dirname(os.path.abspath(app_path))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -595,8 +988,9 @@ def main():
             package = input("\033[93m[?] Enter bundle ID manually (e.g. com.example.app): \033[0m").strip()
 
     # Step 2: Extract Flutter binary
+    arch = None
     if platform == 'android':
-        binary_path = extract_flutter_android(app_path, out_dir)
+        binary_path, arch = extract_flutter_android(app_path, out_dir, args.arch)
     else:
         binary_path = extract_flutter_ios(app_path, out_dir)
 
@@ -604,7 +998,7 @@ def main():
         sys.exit(1)
 
     # Step 3: Find SSL offset
-    offset = find_offset(binary_path, platform)
+    offset = find_offset(binary_path, platform, arch)
     if offset is None:
         sys.exit(1)
 
@@ -618,7 +1012,7 @@ def main():
     else:
         print_commands_ios(package, proxy, script_path, device_ip)
 
-    print_summary(package, offset, script_path, proxy, platform)
+    print_summary(package, offset, script_path, proxy, platform, arch)
 
 
 if __name__ == '__main__':
